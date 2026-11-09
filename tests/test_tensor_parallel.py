@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from forgeserve import ForgeModel, ModelConfig, TPContext, generate, new_contiguous_cache
+from forgeserve import Engine, ForgeModel, ModelConfig, TPContext, generate, new_contiguous_cache
 from forgeserve.tensor_parallel import run_distributed, shard_state_dict
-from conftest import small_cfg
+from conftest import make_model, small_cfg
 
 
 def forward_worker(rank, size, cfg_dict, full_sd, idx):
@@ -22,7 +22,7 @@ def forward_worker(rank, size, cfg_dict, full_sd, idx):
 @pytest.mark.parametrize("size", [2, 4])
 def test_tensor_parallel_matches_single_device(size):
     cfg = small_cfg()
-    ref = ForgeModel(cfg).eval()
+    ref = make_model(cfg)
     idx = torch.randint(0, 64, (3, 12))
     results = run_distributed(forward_worker, size, cfg.to_dict(), ref.state_dict(), idx)
 
@@ -68,3 +68,31 @@ def test_failing_worker_is_reported_not_hung():
 
 def crash_worker(rank, size):
     raise ValueError("boom")
+
+
+def engine_worker(rank, size, cfg_dict, full_sd, requests, num_blocks):
+    """Every shard runs the same engine loop; the KV pool holds only this shard's heads."""
+    cfg = ModelConfig(**cfg_dict)
+    model = ForgeModel(cfg, TPContext(rank, size)).eval()
+    model.load_state_dict(shard_state_dict(full_sd, cfg, rank, size))
+    engine = Engine(model, num_blocks=num_blocks, block_size=4, max_batch=3)
+    for prompt, n in requests:
+        engine.add_request(prompt, n)
+    out = engine.run()
+    return out, engine.preemptions, engine.pool.k[0].shape
+
+
+def test_serving_engine_under_tensor_parallelism():
+    """Continuous batching, paged cache and preemption, with the model split over 2 processes."""
+    cfg = small_cfg()
+    ref = make_model(cfg)
+    g = torch.Generator().manual_seed(3)
+    requests = [(torch.randint(0, 64, (int(torch.randint(3, 18, (1,), generator=g)),), generator=g).tolist(),
+                 int(torch.randint(4, 14, (1,), generator=g))) for _ in range(5)]
+    results = run_distributed(engine_worker, 2, cfg.to_dict(), ref.state_dict(), requests, 12)   # small pool: preemption
+    for rank, (out, preemptions, pool_shape) in enumerate(results):
+        assert preemptions > 0
+        assert pool_shape[1] == cfg.n_kv_heads // 2           # each shard caches only its own KV heads
+        for rid, (prompt, n) in enumerate(requests):
+            want = generate(ref, torch.tensor([prompt]), n)[0].tolist()[len(prompt):]
+            assert out[rid] == want, (rank, rid)

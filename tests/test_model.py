@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from forgeserve import ForgeModel, ModelConfig, generate, new_contiguous_cache
-from conftest import small_cfg
+from conftest import make_model, small_cfg
 
 
 def test_config_validation():
